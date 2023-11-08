@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <inttypes.h>
+#include <assert.h>
 #include "sdkconfig.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -13,40 +14,39 @@
 #include "esp_flash.h"
 #include "esp_system.h"
 
+#include "esp_mmu_map.h"
+#include "esp_partition.h"
+#include "esp_log.h"
+// #include "mmu_types.h"
+#include "esp_heap_caps.h"
+
+static const char *TAG = "example";
+
 void app_main(void)
 {
-    printf("Hello world!\n");
+    const esp_partition_t *partition = esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, "storage1");
+    assert(partition != NULL);
 
-    /* Print chip information */
-    esp_chip_info_t chip_info;
-    uint32_t flash_size;
-    esp_chip_info(&chip_info);
-    printf("This is %s chip with %d CPU core(s), %s%s%s%s, ",
-           CONFIG_IDF_TARGET,
-           chip_info.cores,
-           (chip_info.features & CHIP_FEATURE_WIFI_BGN) ? "WiFi/" : "",
-           (chip_info.features & CHIP_FEATURE_BT) ? "BT" : "",
-           (chip_info.features & CHIP_FEATURE_BLE) ? "BLE" : "",
-           (chip_info.features & CHIP_FEATURE_IEEE802154) ? ", 802.15.4 (Zigbee/Thread)" : "");
+    const void *map_ptr;
+    esp_partition_mmap_handle_t map_handle;
 
-    unsigned major_rev = chip_info.revision / 100;
-    unsigned minor_rev = chip_info.revision % 100;
-    printf("silicon revision v%d.%d, ", major_rev, minor_rev);
-    if(esp_flash_get_size(NULL, &flash_size) != ESP_OK) {
-        printf("Get flash size failed");
-        return;
-    }
+    ESP_ERROR_CHECK(esp_partition_mmap(partition, 0, partition->size, ESP_PARTITION_MMAP_DATA, &map_ptr, &map_handle));
+    ESP_LOGI(TAG, "Mapped partition to data memory address %p", map_ptr);
+    // *(int *)map_ptr = 100;
 
-    printf("%" PRIu32 "MB %s flash\n", flash_size / (uint32_t)(1024 * 1024),
-           (chip_info.features & CHIP_FEATURE_EMB_FLASH) ? "embedded" : "external");
+    // char read_data[sizeof(store_data)];
+    // memcpy(read_data, map_ptr, sizeof(read_data));
+    // ESP_LOGI(TAG, "Read sample data from partition using mapped memory: %s", (char*) read_data);
 
-    printf("Minimum free heap size: %" PRIu32 " bytes\n", esp_get_minimum_free_heap_size());
+    ESP_LOGI(TAG, "address region num in soc_cps.h: %u", SOC_MMU_LINEAR_ADDRESS_REGION_NUM);
+    // static変数のため外部からのアクセスができない
+    // ESP_LOGI(TAG, "address region num in mmu_map.h: %u", (unsigned int)s_mmu_ctx.num_regions);
+    // for (int i = 0; i < s_mmu_ctx.num_regions; i++) {
+    //     ESP_LOGI(TAG, "address region type in mmu_map.h: %u", (unsigned int)s_mmu_ctx.mem_regions[i].targets);    
+    // }
+    esp_mmu_map(0x10000, 0x1000, MMU_TARGET_PSRAM0, MMU_MEM_CAP_READ | MMU_MEM_CAP_8BIT, ESP_MMU_MMAP_FLAG_PADDR_SHARED, map_ptr);
+    // *(int *)map_ptr = 100;
+    // printf("%d\n", *(int *)map_ptr);
 
-    for (int i = 10; i >= 0; i--) {
-        printf("Restarting in %d seconds...\n", i);
-        vTaskDelay(1000 / portTICK_PERIOD_MS);
-    }
-    printf("Restarting now.\n");
-    fflush(stdout);
-    esp_restart();
+    esp_partition_munmap(map_handle);
 }

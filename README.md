@@ -51,3 +51,34 @@ Please use the following feedback channels:
 * For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
 
 We will get back to you as soon as possible.
+
+## External flashのMMUへのマッピングの流れ（esp_partition_mmap()を使用した場合）
+
+1. esp_partition_mmap(ハードウェア上のアドレス、マップする領域のサイズ、メモリの種類（capabilitiesの設定）、仮想アドレス、out_handler(?))
+
+    * components/esp_partition/partition_target
+    * 主にアラインメントをして、次にspi_flash_mmap()を呼び出す
+
+2. spi_flash_mmap(ソースアドレス、サイズ、メモリの種類、仮想アドレス、ハンドラ)
+
+    * components/spi_flash/flash_mmap
+    * 明示的にexternal flashを選択し、esp_mmu_mmap()を呼び出す
+    * heap_calloc()で割り当て、ハンドラを作成する
+
+3. esp_mmu_mmap(ソースアドレス、サイズ、ターゲットデバイス(flash or psram)、capabilities、フラグ、仮想アドレス)
+
+    * components/esp_mm/esp_mmu_map
+    * フラグ：ex) あるソースアドレスが複数の仮想アドレスにマッピングされることを許可
+    * ESP32はpsramをサポートしていない？
+    * ここでどのハードのmmuにマッピングするかを指示する？
+
+```c
+#if !SOC_SPIRAM_SUPPORTED || CONFIG_IDF_TARGET_ESP32
+    ESP_RETURN_ON_FALSE(!(target & MMU_TARGET_PSRAM0), ESP_ERR_NOT_SUPPORTED, TAG, "PSRAM is not supported");
+#endif
+
+    typedef enum {
+        MMU_TARGET_FLASH0 = BIT(0),
+        MMU_TARGET_PSRAM0 = BIT(1),
+    } mmu_target_t;
+```
