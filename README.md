@@ -58,6 +58,7 @@ We will get back to you as soon as possible.
 
     * components/esp_partition/partition_target
     * 主にアラインメントをして、次にspi_flash_mmap()を呼び出す
+    * [ハンドルの説明](https://en.wikipedia.org/wiki/Handle_(computing))
 
 2. spi_flash_mmap(ソースアドレス、サイズ、メモリの種類、仮想アドレス、ハンドラ)
 
@@ -82,3 +83,51 @@ We will get back to you as soon as possible.
         MMU_TARGET_PSRAM0 = BIT(1),
     } mmu_target_t;
 ```
+
+## esp_mmu_map()の解析
+
+### esp_mmu_map()の説明
+
+```
+esp_err_t esp_mmu_map(esp_paddr_t paddr_start, size_t size, mmu_target_t target, mmu_mem_caps_t caps, int flags, void **out_ptr)
+Map a physical memory block to external virtual address block, with given capabilities.
+
+パラメーター:
+paddr_start – Start address of the physical memory block
+size – Size to be mapped. Size will be rounded up by to the nearest multiple of MMU page size
+target – Physical memory target you're going to map to, see mmu_target_t
+caps – Memory capabilities, see mmu_mem_caps_t
+flags – Mmap flags
+out_ptr – Start address of the mapped virtual memory
+
+戻り値:
+
+ESP_OK - ESP_ERR_INVALID_ARG: Invalid argument, see printed logs - ESP_ERR_NOT_SUPPORTED: Only on ESP32, PSRAM is not a supported physical memory target - ESP_ERR_NOT_FOUND: No enough size free block to use - ESP_ERR_NO_MEM: Out of memory, this API will allocate some heap memory for internal usage - ESP_ERR_INVALID_STATE: Paddr is mapped already, this API will return corresponding vaddr_start of the previously mapped block. Only to-be-mapped paddr block is totally enclosed by a previously mapped block will lead to this error. (Identical scenario will behave similarly) new_block_start new_block_end |-------- New Block --------| |--------------- Block ---------------| block_start block_end
+注:
+This API does not guarantee thread safety
+```
+
+この関数は特定の物理メモリブロックをある仮想アドレスブロックに指示されたcapabilitiesに基づいてマップするものである。どの仮想アドレスブロックにマップするかは指定できない。本研究では仮想アドレスブロックを管理するプロセスを作成して、空いている特定の仮想アドレスブロックと物理メモリブロックのマッピングを行える関数の作成を第一の目標とする。そのためにはesp_mmu_map()がどのような流れで処理されているのかを理解する必要がある。
+
+注）このAPIは[スレッド安全](https://ja.wikipedia.org/wiki/%E3%82%B9%E3%83%AC%E3%83%83%E3%83%89%E3%82%BB%E3%83%BC%E3%83%95)を保証しない
+
+#### 想定されるエラー
+* ESP_ERR_INVALID_ARG: 引数に関するエラー
+* ESP_ERR_NOTE_SUPPORTED: __動いているMCUがESP32で、なおかつPSRAMをターゲットデバイスとしている場合に発生するエラー__
+* ESP_ERR_NOT_FOUND: 十分なサイズのフリーブロックが存在しないとき発生するエラー（仮想？物理？）
+* ESP_ERR_NO_MEM: メモリ不足の際に発生するエラー（ESP_ERR_NOT_FOUNDとの違いは？）
+* ESP_ERR_INVALID_STATE: 物理アドレスが既にマップされている場合に発生するエラー、現在のマップ先の仮想アドレスを返す、[物理アドレブロックが完全に別の物理アドレスブロックに包含されている場合にのみ発生する](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/mm.html#relation-between-memory-blocks)
+
+#### 処理の流れ
+```c
+    esp_err_t ret = ESP_FAIL;
+    ESP_RETURN_ON_FALSE(out_ptr, ESP_ERR_INVALID_ARG, TAG, "null pointer");
+#if !SOC_SPIRAM_SUPPORTED || CONFIG_IDF_TARGET_ESP32
+    ESP_RETURN_ON_FALSE(!(target & MMU_TARGET_PSRAM0), ESP_ERR_NOT_SUPPORTED, TAG, "PSRAM is not supported");
+#endif
+    ESP_RETURN_ON_FALSE((paddr_start % CONFIG_MMU_PAGE_SIZE == 0), ESP_ERR_INVALID_ARG, TAG, "paddr must be rounded up to the nearest multiple of CONFIG_MMU_PAGE_SIZE");
+    ESP_RETURN_ON_ERROR(s_mem_caps_check(caps), TAG, "invalid caps");
+
+```
+
+最初は状態のチェックから始めている。
