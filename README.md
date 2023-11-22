@@ -1,57 +1,7 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C6 | ESP32-H2 | ESP32-P4 | ESP32-S2 | ESP32-S3 |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | -------- | -------- | -------- |
-
-# Hello World Example
-
-Starts a FreeRTOS task to print "Hello World".
-
-(See the README.md file in the upper level 'examples' directory for more information about examples.)
-
-## How to use example
-
-Follow detailed instructions provided specifically for this example.
-
-Select the instructions depending on Espressif chip installed on your development board:
-
-- [ESP32 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/stable/get-started/index.html)
-- [ESP32-S2 Getting Started Guide](https://docs.espressif.com/projects/esp-idf/en/latest/esp32s2/get-started/index.html)
-
-
-## Example folder contents
-
-The project **hello_world** contains one source file in C language [hello_world_main.c](main/hello_world_main.c). The file is located in folder [main](main).
-
-ESP-IDF projects are built using CMake. The project build configuration is contained in `CMakeLists.txt` files that provide set of directives and instructions describing the project's source files and targets (executable, library, or both).
-
-Below is short explanation of remaining files in the project folder.
-
-```
-├── CMakeLists.txt
-├── pytest_hello_world.py      Python script used for automated testing
-├── main
-│   ├── CMakeLists.txt
-│   └── hello_world_main.c
-└── README.md                  This is the file you are currently reading
-```
-
-For more information on structure and contents of ESP-IDF projects, please refer to Section [Build System](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/build-system.html) of the ESP-IDF Programming Guide.
-
-## Troubleshooting
-
-* Program upload failure
-
-    * Hardware connection is not correct: run `idf.py -p PORT monitor`, and reboot your board to see if there are any output logs.
-    * The baud rate for downloading is too high: lower your baud rate in the `menuconfig` menu, and try again.
-
-## Technical support and feedback
-
-Please use the following feedback channels:
-
-* For technical queries, go to the [esp32.com](https://esp32.com/) forum
-* For a feature request or bug report, create a [GitHub issue](https://github.com/espressif/esp-idf/issues)
-
-We will get back to you as soon as possible.
-
+# MMUをesp32上で自由に使えるようにしよう
+[external-flashのmmuへのマッピングの流れ](#external-flashのmmuへのマッピングの流れesp_partition_mmapを使用した場合)<br>
+[esp_mmu_mapの解析](#esp_mmu_mapの解析)<br>
+[esp_mmu_mapの説明](#esp_mmu_mapの説明)<br>
 ## External flashのMMUへのマッピングの流れ（esp_partition_mmap()を使用した場合）
 
 1. esp_partition_mmap(ハードウェア上のアドレス、マップする領域のサイズ、メモリの種類（capabilitiesの設定）、仮想アドレス、out_handler(?))
@@ -118,7 +68,8 @@ This API does not guarantee thread safety
 * ESP_ERR_NO_MEM: メモリ不足の際に発生するエラー（ESP_ERR_NOT_FOUNDとの違いは？）
 * ESP_ERR_INVALID_STATE: 物理アドレスが既にマップされている場合に発生するエラー、現在のマップ先の仮想アドレスを返す、[物理アドレブロックが完全に別の物理アドレスブロックに包含されている場合にのみ発生する](https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-reference/system/mm.html#relation-between-memory-blocks)
 
-#### 処理の流れ
+### 処理の流れ
+#### 実行前処理
 ```c
     esp_err_t ret = ESP_FAIL;
     ESP_RETURN_ON_FALSE(out_ptr, ESP_ERR_INVALID_ARG, TAG, "null pointer");
@@ -130,4 +81,97 @@ This API does not guarantee thread safety
 
 ```
 
-最初は状態のチェックから始めている。
+まずは実行前状態のチェックから入る。最初は戻り値を初期化している。次にout_ptrの参照先が存在しない（＝out_ptrがNULL）なら、引数エラーを返す。そして、SPIRAMを対応していないデバイス上でSPIRAMを利用としている場合はエラーを発生させる。次は物理アドレスがページのアラインメントに従っているかをチェックしている。そして最後に設定したcapabilityをチェックする。このs_mem_cpas_check()関数は以下の通りになっている。
+
+```c
+static esp_err_t s_mem_caps_check(mmu_mem_caps_t caps)
+{
+    if (caps & MMU_MEM_CAP_EXEC) {
+        if ((caps & MMU_MEM_CAP_8BIT) || (caps & MMU_MEM_CAP_WRITE)) {
+            //None of the executable memory are expected to be 8-bit accessible or writable.
+            return ESP_ERR_INVALID_ARG;
+        }
+        caps |= MMU_MEM_CAP_32BIT;
+    }
+    return ESP_OK;
+}
+```
+
+ここで重要になってくるのはMMU_MEM_CAP_EXECマクロである。このマクロは実行可能領域として物理アドレスをマッピングすることを表し、その際に8ビット読み込みや書き出し可能のcapabilityを同時に設定してはいけない。なぜなら実行可能領域は32bitでしか読み込めず、またプログラムを保護するために書き出すことはできない。設定されているcapabilityが健全であることをチェックしたら、OKを返す。
+
+参考記事：
+* [iramは32 bit alignedされる必要がある](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/mem_alloc.html#memory-capabilities)
+* [32 bit capabilityを設定する際の留意点](https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/mem_alloc.html#bit-accessible-memory)
+
+
+#### 利用可能な仮想記憶ブロックの探索: _s_find_available_region()_
+```c
+    size_t aligned_size = ALIGN_UP_BY(size, CONFIG_MMU_PAGE_SIZE);
+    int32_t found_region_id = s_find_available_region(s_mmu_ctx.mem_regions, s_mmu_ctx.num_regions, aligned_size, caps, target);
+    if (found_region_id == -1) {
+        ESP_EARLY_LOGE(TAG, "no such vaddr range");
+        return ESP_ERR_NOT_FOUND;
+    }
+```
+
+ALIGN_UP_BYは要求するメモリ領域のサイズsize以上のCONFIG_MMU_PAGE_SIZEの倍数の中で、最小のものを返すマクロである。これによりアラインメントの規則を守りながらメモリを最小限に抑えることができる。例えばCONFIG_MMU_PAGE_SIZEが0x100の場合、sizeが0x99なら0x100、0x100なら0x100、0x101なら0x200を返すようになっている。次にs_find_availble_region()を呼び出して、利用可能なブロックが残されていれば次の処理を続ける。ちなみにs_mmu_ctxのctxはコンテキストのことらしい。
+
+```c
+static int32_t s_find_available_region(mem_region_t *mem_regions, uint32_t region_nums, size_t size, mmu_mem_caps_t caps, mmu_target_t target)
+{
+    int32_t found_region_id = -1;
+    for (int i = 0; i < region_nums; i++) {
+        if (((mem_regions[i].caps & caps) == caps) && ((mem_regions[i].targets & target) == target)) {
+            if (mem_regions[i].max_slot_size >= size) {
+                found_region_id = i;
+                break;
+            }
+        }
+    }
+    return found_region_id;
+}
+```
+* mem_regions: 仮装記憶領域（iramとかdromとかdramとか）、mem_regionsごとにtargetが決まっている
+* regioin_nums: mem_regionsの数
+* size: ページサイズにアラインメントされたマッピングに必要な領域の大きさ
+* caps: [チェックされた後のcapability](#実行前処理)
+* target: 物理メモリを提供するターゲットデバイス
+
+フリーな仮想記憶領域の中で、要求しているcapabilityとtargetを満たすものの中で、size以上のスロットを持っている場合は、その領域のidを返す。-1が返されたら該当の領域は見つからなかったことになる。これを呼び出しているs_mmu_ctxはフリーな仮想記憶領域の情報を保持している。
+__＊ESP32では仮装アドレスはアドレス領域ごとに異なるデバイスにマップされるため、仮想記憶領域ごとにtargetとcapabilityが設定されている。__
+以下は各仮想記憶領域を管理するmmu_ctx_tという構造体の定義と、かく仮想記憶領域で保持される情報をまとめたmem_region_という構造体の定義である。以下のフィールドの中で留意すべきものを示す。
+* free_head: 領域内で未使用部分の開始アドレス
+__（多分esp32では解放されてもコンパクションが行われるまでは再利用されない？）__
+* mem_block_head: 割り当てられたブロックの情報を格納しているリスト
+__（解放時にこのリストに対して操作？コンパクションをやるとしたらこれを基にやる？）__
+* 
+
+```c
+typedef struct {
+    /**
+     * number of memory regions that are available, after coalescing, this number should be smaller than or equal to `SOC_MMU_LINEAR_ADDRESS_REGION_NUM`
+     */
+    uint32_t num_regions;
+    /**
+     * This saves the available MMU linear address regions,
+     * after reserving flash .rodata and .text, and after coalescing.
+     * Only the first `num_regions` items are valid
+     */
+    mem_region_t mem_regions[SOC_MMU_LINEAR_ADDRESS_REGION_NUM];
+} mmu_ctx_t;
+```
+
+```c
+typedef struct mem_region_ {
+    cache_bus_mask_t bus_id;  //cache bus mask of this region
+    uint32_t start;           //linear address start of this region
+    uint32_t end;             //linear address end of this region
+    size_t region_size;       //region size, in bytes
+    uint32_t free_head;       //linear address free head of this region
+    size_t max_slot_size;     //max slot size within this region
+    int caps;                 //caps of this region, `mmu_mem_caps_t`
+    mmu_target_t targets;     //physical targets that this region is supported
+    TAILQ_HEAD(mem_block_head_, mem_block_) mem_block_head;      //link head of allocated blocks within this region
+} mem_region_t;
+```
+
