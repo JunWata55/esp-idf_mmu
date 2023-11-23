@@ -2,6 +2,11 @@
 [external-flashのmmuへのマッピングの流れ](#external-flashのmmuへのマッピングの流れesp_partition_mmapを使用した場合)<br>
 [esp_mmu_mapの解析](#esp_mmu_mapの解析)<br>
 [esp_mmu_mapの説明](#esp_mmu_mapの説明)<br>
+
+## はじめに
+使用しているMCUはM5Stack Fireであり、乗っているチップはESPIDFによるとESP32-D0WDQ6-V3である。
+16MBのexternal memoryを積んでいるが、全部を利用可能にするためにはmenuconfigからserial flasher config->flash sizeで設定を変更する必要がある？
+
 ## External flashのMMUへのマッピングの流れ（esp_partition_mmap()を使用した場合）
 
 1. esp_partition_mmap(ハードウェア上のアドレス、マップする領域のサイズ、メモリの種類（capabilitiesの設定）、仮想アドレス、out_handler(?))
@@ -144,7 +149,8 @@ __＊ESP32では仮装アドレスはアドレス領域ごとに異なるデバ�
 __（多分esp32では解放されてもコンパクションが行われるまでは再利用されない？）__
 * mem_block_head: 割り当てられたブロックの情報を格納しているリスト
 __（解放時にこのリストに対して操作？コンパクションをやるとしたらこれを基にやる？）__
-* 
+
+__ちなみにTAILQは[tail queue](https://www.hazymoon.jp/OpenBSD/sys/queue/tail_queue.html)のことらしい。__
 
 ```c
 typedef struct {
@@ -175,3 +181,90 @@ typedef struct mem_region_ {
 } mem_region_t;
 ```
 
+#### 探索されたブロックに対する操作
+
+```c
+    mem_region_t *found_region = &s_mmu_ctx.mem_regions[found_region_id];
+    mem_block_t *dummy_head = NULL;
+    mem_block_t *dummy_tail = NULL;
+    mem_block_t *new_block = NULL;
+```
+まずは必要な変数を初期化する。
+
+次に実際に〜〜〜していく。最初に見ているTAILQ_EMPTYはmem_block_headが指すリストの先頭要素(tqh_first)がNULLかどうかを見ている。つまり〜〜〜のとき、、、
+internal heap上にdummy_head(以降dhと呼ぶ)を作成し、dhのladdr_startとladdr_endを共にfound_regionのfree_headにしている。
+TAILQ_INSERT_HEADはdummy_headをtail queueの先頭に挿入するマクロであり、TAILQ _INSERT _TAILは末尾に挿入するマクロである。
+__こうすることで多分リストが空かどうかを意識することなくこれ以降の探索を行えるようになると思う。__
+
+__これ重要！空の時この操作がされるということは、全てのtail queueは先頭と末尾にダミーセルを持っていることを示す__
+
+```c
+    if (TAILQ_EMPTY(&found_region->mem_block_head)) {
+        dummy_head = (mem_block_t *)heap_caps_calloc(1, sizeof(mem_block_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_GOTO_ON_FALSE(dummy_head, ESP_ERR_NO_MEM, err, TAG, "no mem");
+
+        dummy_head->laddr_start = found_region->free_head;
+        dummy_head->laddr_end = found_region->free_head;
+        //We don't care vaddr or paddr address for dummy head
+        dummy_head->size = 0;
+        dummy_head->caps = caps;
+        TAILQ_INSERT_HEAD(&found_region->mem_block_head, dummy_head, entries);
+
+        dummy_tail = (mem_block_t *)heap_caps_calloc(1, sizeof(mem_block_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_GOTO_ON_FALSE(dummy_tail, ESP_ERR_NO_MEM, err, TAG, "no mem");
+
+        dummy_tail->laddr_start = found_region->end;
+        dummy_tail->laddr_end = found_region->end;
+        //We don't care vaddr or paddr address for dummy tail
+        dummy_tail->size = 0;
+        dummy_tail->caps = caps;
+        TAILQ_INSERT_TAIL(&found_region->mem_block_head, dummy_tail, entries);
+    }
+```
+
+以下がmem_block_(mem_block_t)の定義である。TAILQ_ENTRYはtail queueの要素を表す。mem_block_は物理アドレスと仮装アドレスのいずれかを表現することができる。
+```c
+typedef struct mem_block_ {
+    uint32_t laddr_start;  //linear address start of this block
+    uint32_t laddr_end;    //linear address end of this block
+    intptr_t vaddr_start;  //virtual address start of this block
+    intptr_t vaddr_end;    //virtual address end of this block
+    size_t size;           //size of this block, should be aligned to MMU page size
+    int caps;              //caps of this block, `mmu_mem_caps_t`
+    uint32_t paddr_start;  //physical address start of this block
+    uint32_t paddr_end;    //physical address end of this block
+    mmu_target_t target;   //physical target that this block is mapped to
+    TAILQ_ENTRY(mem_block_) entries;  //link entry
+} mem_block_t;
+```
+
+ブロックはマップされたされた仮想アドレス領域に対応する、tail queueで保存される
+スロットはブロック間のフリースペースを表す、そこを探索することでまだマップされていないアドレス領域を探索することができる
+
+実際のマッピングをしている関数はs_do_mapping()である。
+
+
+### s_do_mapping()の処理の流れ
+
+```c
+    // Suspend the scehduler on both CPUs, disable cache.
+    // Contrary to its name this doesn't do anything with interrupts, yet.
+    // Interrupt disabling capability will be added once we implement interrupt allocation API.
+    spi_flash_disable_interrupts_caches_and_other_cpu();
+
+    uint32_t actual_mapped_len = s_mapping_operation(target, vaddr_start, paddr_start, size);
+
+    cache_bus_mask_t bus_mask = cache_ll_l1_get_bus(0, vaddr_start, size);
+    cache_ll_l1_enable_bus(0, bus_mask);
+
+    bus_mask = cache_ll_l1_get_bus(0, vaddr_start, size);
+    cache_ll_l1_enable_bus(1, bus_mask);
+
+    s_do_cache_invalidate(vaddr_start, size);
+
+    // Enable cache, enable interrupts (to be added in future), resume scheduler
+    spi_flash_enable_interrupts_caches_and_other_cpu();
+```
+
+spi_flash_disable_interrupts_caches_and_other_cpu()とspi_flash_enable_interrupts_caches_and_other_cpu()はそれぞれフラッシュに対する操作を行う際に他のプロセスによってインターリーブ等の問題が発生することを防ぐために割込みを一時的に禁止する領域を指定できる。
+前者の関数はクリティカルセクションの開始地点を表し、後者はその終了地点を表す。
